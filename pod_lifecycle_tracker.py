@@ -17,6 +17,7 @@ import gzip
 import json
 import re
 import os
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
@@ -113,11 +114,47 @@ class PodLifecycleDB:
             INSERT INTO pods (uid, namespace, name, node, created_at, yaml_path)
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(uid) DO UPDATE SET
+                namespace = excluded.namespace,
+                name = excluded.name,
                 node = COALESCE(excluded.node, node),
                 created_at = COALESCE(excluded.created_at, created_at),
                 yaml_path = COALESCE(excluded.yaml_path, yaml_path)
         """, (uid, namespace, name, node, created_at, yaml_path))
         self.conn.commit()
+
+    def ensure_pod_exists(self, uid: str, namespace: str, name: str, node: str = None) -> bool:
+        """Ensure pod record exists, creating minimal record if needed.
+        Returns True if new record was created."""
+        if uid and namespace and name:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT uid FROM pods WHERE uid = ?", (uid,))
+            exists = cursor.fetchone() is not None
+            if not exists:
+                self.insert_pod(uid, namespace, name, node)
+            return not exists
+        return False
+
+    def ensure_pod_exists_by_name(self, namespace: str, name: str, node: str = None) -> bool:
+        """Ensure pod exists by namespace/name (no UID known).
+        Generates synthetic UID from hash of namespace/name.
+        Returns True if new record was created."""
+        if namespace and name:
+            cursor = self.conn.cursor()
+            # Check if pod already exists by namespace/name
+            cursor.execute("SELECT uid FROM pods WHERE namespace = ? AND name = ?", (namespace, name))
+            existing = cursor.fetchone()
+            if existing:
+                return False
+
+            # Generate synthetic UID from namespace/name
+            synthetic_uid = f"log-{hashlib.sha256(f'{namespace}/{name}'.encode()).hexdigest()[:32]}"
+            cursor.execute("SELECT uid FROM pods WHERE uid = ?", (synthetic_uid,))
+            if cursor.fetchone():
+                return False  # Already exists with synthetic UID
+
+            self.insert_pod(synthetic_uid, namespace, name, node)
+            return True
+        return False
 
     def insert_event(self, pod_uid: Optional[str], namespace: str, pod_name: str,
                      event_time: str, reason: str, message: str, source: str = None,
@@ -167,7 +204,9 @@ class MustGatherParser:
         self.base_path = Path(must_gather_path)
         self.db = db
         self.stats = {
-            'pods': 0,
+            'pods_from_yaml': 0,
+            'pods_from_events': 0,
+            'pods_from_logs': 0,
             'events': 0,
             'log_events': 0,
             'errors': 0
@@ -183,14 +222,22 @@ class MustGatherParser:
         print("  Parsing K8s events...")
         self.parse_events()
 
+        print("  Parsing scheduler logs...")
+        self.parse_scheduler_logs()
+
         print("  Parsing kubelet logs...")
         self.parse_kubelet_logs()
 
         print("  Parsing crio logs...")
         self.parse_crio_logs()
 
+        # Get total pod count from DB
+        cursor = self.db.conn.cursor()
+        cursor.execute("SELECT COUNT(*) as count FROM pods")
+        total_pods = cursor.fetchone()['count']
+
         print(f"\nParsing complete:")
-        print(f"  Pods: {self.stats['pods']}")
+        print(f"  Pods: {total_pods} ({self.stats['pods_from_yaml']} from YAML, {self.stats['pods_from_events']} from events, {self.stats['pods_from_logs']} from logs)")
         print(f"  Events: {self.stats['events']}")
         print(f"  Log events: {self.stats['log_events']}")
         print(f"  Errors: {self.stats['errors']}")
@@ -229,7 +276,7 @@ class MustGatherParser:
                 if uid and namespace and name:
                     self.db.insert_pod(uid, namespace, name, node, created_at,
                                       str(yaml_file.relative_to(self.base_path)))
-                    self.stats['pods'] += 1
+                    self.stats['pods_from_yaml'] += 1
 
                     # Extract container info
                     for container in spec.get('containers', []):
@@ -304,6 +351,10 @@ class MustGatherParser:
                 if node_match:
                     node = node_match.group(1)
 
+            # Ensure pod exists (auto-discover from events)
+            if self.db.ensure_pod_exists(pod_uid, namespace, pod_name, node):
+                self.stats['pods_from_events'] += 1
+
             self.db.insert_event(
                 pod_uid, namespace, pod_name, event_time, reason, message,
                 source.get('host'), source_component, node, event_type, source_file
@@ -313,6 +364,69 @@ class MustGatherParser:
         except Exception as e:
             print(f"    Error parsing event: {e}")
             self.stats['errors'] += 1
+
+    def parse_scheduler_logs(self):
+        """Parse kube-scheduler logs for scheduling decisions."""
+        scheduler_logs = self.base_path.glob("namespaces/openshift-kube-scheduler/pods/*/kube-scheduler/kube-scheduler/logs/*.log")
+
+        for log_file in scheduler_logs:
+            try:
+                with open(log_file, 'r') as f:
+                    for line in f:
+                        self._parse_scheduler_line(line, str(log_file.relative_to(self.base_path)))
+
+            except Exception as e:
+                print(f"    Error parsing {log_file}: {e}")
+                self.stats['errors'] += 1
+
+    def _parse_scheduler_line(self, line: str, source_file: str):
+        """Parse individual scheduler log line for scheduling decisions."""
+        # Format: 2026-09-18T21:10:49.848779631Z I0918 21:10:49.848732       1 schedule_one.go:314] "Successfully bound pod to node" pod="namespace/podname" node="nodename" evaluatedNodes=19 feasibleNodes=15
+
+        # Look for schedule_one.go messages
+        if 'schedule_one.go' not in line or 'Successfully bound pod to node' not in line:
+            return
+
+        # Extract timestamp
+        ts_match = re.match(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)', line)
+        if not ts_match:
+            return
+        timestamp = ts_match.group(1)
+
+        # Extract pod (namespace/name format)
+        pod_match = re.search(r'pod="([^/]+)/([^"]+)"', line)
+        if not pod_match:
+            return
+        namespace, pod_name = pod_match.groups()
+
+        # Extract node
+        node_match = re.search(r'node="([^"]+)"', line)
+        node = node_match.group(1) if node_match else None
+
+        # Extract metrics
+        eval_nodes_match = re.search(r'evaluatedNodes=(\d+)', line)
+        feasible_nodes_match = re.search(r'feasibleNodes=(\d+)', line)
+
+        metrics = []
+        if eval_nodes_match:
+            metrics.append(f"evaluated={eval_nodes_match.group(1)}")
+        if feasible_nodes_match:
+            metrics.append(f"feasible={feasible_nodes_match.group(1)}")
+
+        message = f"Successfully bound pod to node {node}"
+        if metrics:
+            message += f" ({', '.join(metrics)})"
+
+        # Ensure pod exists (auto-discover from scheduler logs)
+        if self.db.ensure_pod_exists_by_name(namespace, pod_name, node):
+            self.stats['pods_from_logs'] += 1
+
+        # Record as log event
+        self.db.insert_log_event(
+            timestamp, None, pod_name, namespace, node or '',
+            'scheduler', 'INFO', message, source_file
+        )
+        self.stats['log_events'] += 1
 
     def parse_kubelet_logs(self):
         """Parse kubelet journal logs."""
@@ -368,6 +482,10 @@ class MustGatherParser:
                     log_level = 'WARN'
                 elif ' E' in message[:10]:
                     log_level = 'ERROR'
+
+                # Ensure pod exists (auto-discover from logs)
+                if self.db.ensure_pod_exists_by_name(namespace, pod_name, node):
+                    self.stats['pods_from_logs'] += 1
 
                 self.db.insert_log_event(
                     timestamp, None, pod_name, namespace, node,
