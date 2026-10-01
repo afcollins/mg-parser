@@ -85,6 +85,9 @@ Shows:
 # List all pods in namespace
 python3 pod_lifecycle_tracker.py --list --namespace openshift-monitoring
 
+# Export the list as CSV
+python3 pod_lifecycle_tracker.py --list --csv > pods.csv
+
 # With time filter
 python3 pod_lifecycle_tracker.py --list \
   --namespace openshift-monitoring \

@@ -721,6 +721,16 @@ class OutputFormatter:
         return output.getvalue()
 
     @staticmethod
+    def format_pod_list_csv(pods: List[Dict]) -> str:
+        """Format pod list results as CSV."""
+        fieldnames = ['uid', 'namespace', 'name', 'node', 'created_at']
+        output = io.StringIO(newline='')
+        writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(pods)
+        return output.getvalue()
+
+    @staticmethod
     def format_timeline(lifecycle: Dict) -> str:
         """Format pod lifecycle as timeline."""
         output = []
@@ -852,7 +862,7 @@ def main():
     parser.add_argument('--search', action='store_true',
                        help='Quick search for pods in time window (requires --time-start and --time-end)')
     parser.add_argument('--csv', action='store_true',
-                       help='Output --search results as CSV')
+                       help='Output --search or --list results as CSV')
 
     args = parser.parse_args()
 
@@ -885,7 +895,10 @@ def main():
 
     elif args.list:
         pods = query.list_pods(args.time_start, args.time_end, args.namespace)
-        print(OutputFormatter.format_pod_list(pods))
+        if args.csv:
+            print(OutputFormatter.format_pod_list_csv(pods), end='')
+        else:
+            print(OutputFormatter.format_pod_list(pods))
 
     elif args.stats:
         stats = query.get_scheduling_stats()

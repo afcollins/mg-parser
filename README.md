@@ -62,6 +62,9 @@ python3 pod_lifecycle_tracker.py --pod "abc123-uid-456"
 # All pods
 python3 pod_lifecycle_tracker.py --list
 
+# Export all pods as CSV
+python3 pod_lifecycle_tracker.py --list --csv > pods.csv
+
 # Filter by namespace
 python3 pod_lifecycle_tracker.py --list --namespace openshift-ingress
 
