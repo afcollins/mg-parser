@@ -779,7 +779,9 @@ class OutputFormatter:
         output.append(f"{'-'*155}")
 
         for pod in pods:
-            output.append(f"{pod['namespace']:<40} {pod['name']:<50} {pod.get('node', 'N/A'):<35} {pod.get('created_at', 'N/A'):<28}")
+            node = pod.get('node') or 'N/A'
+            created_at = pod.get('created_at') or 'N/A'
+            output.append(f"{pod['namespace']:<40} {pod['name']:<50} {node:<35} {created_at:<28}")
 
         output.append(f"\nTotal: {len(pods)} pods\n")
         return '\n'.join(output)
