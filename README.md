@@ -40,6 +40,14 @@ python3 pod_lifecycle_tracker.py --search \
   --time-end "2026-04-30T02:00:00Z"
 ```
 
+For machine-readable results, add `--csv`:
+
+```bash
+python3 pod_lifecycle_tracker.py --search --csv \
+  --time-start "2026-04-30T01:30:00Z" \
+  --time-end "2026-04-30T02:00:00Z" > search-results.csv
+```
+
 **Get full lifecycle for specific pod:**
 ```bash
 # By namespace/name

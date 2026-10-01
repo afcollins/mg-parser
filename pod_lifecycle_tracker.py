@@ -12,9 +12,11 @@ Detects anomalies like double-scheduling.
 """
 
 import sqlite3
+import csv
 import yaml
 import gzip
 import json
+import io
 import re
 import os
 import hashlib
@@ -709,6 +711,16 @@ class OutputFormatter:
     """Format query results for display."""
 
     @staticmethod
+    def format_search_csv(pods: List[Dict]) -> str:
+        """Format search results as CSV."""
+        fieldnames = ['uid', 'namespace', 'name', 'first_event', 'last_event']
+        output = io.StringIO(newline='')
+        writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(pods)
+        return output.getvalue()
+
+    @staticmethod
     def format_timeline(lifecycle: Dict) -> str:
         """Format pod lifecycle as timeline."""
         output = []
@@ -837,6 +849,8 @@ def main():
     parser.add_argument('--time-end', help='End time filter (ISO format)')
     parser.add_argument('--search', action='store_true',
                        help='Quick search for pods in time window (requires --time-start and --time-end)')
+    parser.add_argument('--csv', action='store_true',
+                       help='Output --search results as CSV')
 
     args = parser.parse_args()
 
@@ -857,12 +871,15 @@ def main():
             return
 
         pods = query.search_pods(args.time_start, args.time_end)
-        print(f"\nFound {len(pods)} pods scheduled between {args.time_start} and {args.time_end}:")
-        print(f"\n{'UID':<38} {'Namespace':<30} {'Name':<40} {'First Event':<28} {'Last Event':<28}")
-        print(f"{'-'*165}")
-        for pod in pods:
-            print(f"{pod['uid']:<38} {pod['namespace']:<30} {pod['name']:<40} {pod['first_event']:<28} {pod['last_event']:<28}")
-        print()
+        if args.csv:
+            print(OutputFormatter.format_search_csv(pods), end='')
+        else:
+            print(f"\nFound {len(pods)} pods scheduled between {args.time_start} and {args.time_end}:")
+            print(f"\n{'UID':<38} {'Namespace':<30} {'Name':<40} {'First Event':<28} {'Last Event':<28}")
+            print(f"{'-'*165}")
+            for pod in pods:
+                print(f"{pod['uid']:<38} {pod['namespace']:<30} {pod['name']:<40} {pod['first_event']:<28} {pod['last_event']:<28}")
+            print()
 
     elif args.list:
         pods = query.list_pods(args.time_start, args.time_end, args.namespace)

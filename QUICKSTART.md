@@ -29,6 +29,14 @@ python3 pod_lifecycle_tracker.py --search \
 # Output: table with UID, namespace, name, first/last event times
 ```
 
+To export the matching pods as CSV:
+
+```bash
+python3 pod_lifecycle_tracker.py --search --csv \
+  --time-start "2026-04-30T01:34:00Z" \
+  --time-end "2026-04-30T01:35:00Z" > search-results.csv
+```
+
 From current data: **8 pods** scheduled between 01:34:00 and 01:35:00.
 
 ### 2. Trace specific pod lifecycle
