@@ -31,6 +31,21 @@ python3 pod_lifecycle_tracker.py . --parse
 
 This creates `pod_lifecycle.db` with all parsed data.
 
+### Rebuild after parser changes or a repeated parse
+
+Parsing adds events, log events, and container records to the database; it does
+not replace previously parsed records. Before parsing the same must-gather again
+or after updating this tool's parsers, remove the old database and rebuild it:
+
+```bash
+rm -f pod_lifecycle.db
+python3 pod_lifecycle_tracker.py . --parse
+```
+
+If you use `--db`, remove that database file instead. This is required for the
+kubelet filename-discovery change so the new files are included without retaining
+the incomplete prior result set.
+
 ### 2. Query patterns
 
 **Quick search - find pods scheduled in time window:**

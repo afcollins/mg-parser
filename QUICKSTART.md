@@ -155,7 +155,7 @@ python3 pod_lifecycle_tracker.py --double-scheduled
 
 ✅ K8s events YAML (`namespaces/*/core/events.yaml`)  
 ✅ Pod metadata YAML (`namespaces/*/pods/*/`)  
-✅ Kubelet logs (`nodes/*/ip-*_logs_kubelet.gz`)  
+✅ Kubelet logs (`nodes/*/*_logs_kubelet.gz`)
 ✅ CRI-O logs (`host_service_logs/*/crio_service.log`)
 
 All correlated by pod UID/namespace/name.

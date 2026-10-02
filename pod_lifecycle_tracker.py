@@ -432,7 +432,7 @@ class MustGatherParser:
 
     def parse_kubelet_logs(self):
         """Parse kubelet journal logs."""
-        kubelet_logs = self.base_path.glob("nodes/*/ip-*_logs_kubelet.gz")
+        kubelet_logs = self.base_path.glob("nodes/*/*_logs_kubelet.gz")
 
         for log_file in kubelet_logs:
             node_name = log_file.parent.name
