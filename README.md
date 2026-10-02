@@ -39,6 +39,14 @@ progress interval when you want more or less frequent updates:
 python3 pod_lifecycle_tracker.py . --parse --verbose --progress-interval 1000
 ```
 
+Parser writes are committed in batches of 1,000 records for speed. Change that
+size with `--commit-interval`; larger values are faster but leave more recent
+work uncommitted if parsing is interrupted:
+
+```bash
+python3 pod_lifecycle_tracker.py . --parse --commit-interval 5000
+```
+
 ### Rebuild after parser changes or a repeated parse
 
 Parsing adds events, log events, and container records to the database; it does

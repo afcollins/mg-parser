@@ -34,6 +34,8 @@ class PodLifecycleDB:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
+        self.commit_interval = 1
+        self.pending_writes = 0
         self.create_schema()
 
     def create_schema(self):
@@ -106,7 +108,22 @@ class PodLifecycleDB:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_log_events_time ON log_events(timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_pods_namespace_name ON pods(namespace, name)")
 
+        self.commit()
+
+    def set_commit_interval(self, interval: int):
+        """Set the number of writes to group in each database transaction."""
+        self.commit_interval = interval
+
+    def commit(self):
+        """Commit pending database writes."""
         self.conn.commit()
+        self.pending_writes = 0
+
+    def _commit_if_needed(self):
+        """Commit immediately or after the configured write batch is full."""
+        self.pending_writes += 1
+        if self.pending_writes >= self.commit_interval:
+            self.commit()
 
     def insert_pod(self, uid: str, namespace: str, name: str, node: str = None,
                    created_at: str = None, yaml_path: str = None):
@@ -122,7 +139,7 @@ class PodLifecycleDB:
                 created_at = COALESCE(excluded.created_at, created_at),
                 yaml_path = COALESCE(excluded.yaml_path, yaml_path)
         """, (uid, namespace, name, node, created_at, yaml_path))
-        self.conn.commit()
+        self._commit_if_needed()
 
     def ensure_pod_exists(self, uid: str, namespace: str, name: str, node: str = None) -> bool:
         """Ensure pod record exists, creating minimal record if needed.
@@ -170,7 +187,7 @@ class PodLifecycleDB:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (pod_uid, namespace, pod_name, event_time, reason, message,
               source, source_component, node, event_type, source_file))
-        self.conn.commit()
+        self._commit_if_needed()
 
     def insert_log_event(self, timestamp: str, pod_uid: Optional[str], pod_name: str,
                          namespace: str, node: str, log_source: str, log_level: str,
@@ -183,7 +200,7 @@ class PodLifecycleDB:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (timestamp, pod_uid, pod_name, namespace, node, log_source,
               log_level, message, source_file))
-        self.conn.commit()
+        self._commit_if_needed()
 
     def insert_container(self, pod_uid: str, container_name: str, image: str):
         """Insert container record."""
@@ -192,10 +209,11 @@ class PodLifecycleDB:
             INSERT INTO containers (pod_uid, container_name, image)
             VALUES (?, ?, ?)
         """, (pod_uid, container_name, image))
-        self.conn.commit()
+        self._commit_if_needed()
 
     def close(self):
         """Close database connection."""
+        self.commit()
         self.conn.close()
 
 
@@ -208,6 +226,7 @@ class MustGatherParser:
         self.db = db
         self.verbose = verbose
         self.progress_interval = progress_interval
+        self.known_log_pods = set()
         self.stats = {
             'pods_from_yaml': 0,
             'pods_from_events': 0,
@@ -251,6 +270,17 @@ class MustGatherParser:
         print(f"  Events: {self.stats['events']}")
         print(f"  Log events: {self.stats['log_events']}")
         print(f"  Errors: {self.stats['errors']}")
+        self.db.commit()
+
+    def ensure_log_pod_exists(self, namespace: str, pod_name: str, node: str):
+        """Ensure a pod exists once per namespace/name pair during this parse."""
+        pod_key = (namespace, pod_name)
+        if pod_key in self.known_log_pods:
+            return
+
+        if self.db.ensure_pod_exists_by_name(namespace, pod_name, node):
+            self.stats['pods_from_logs'] += 1
+        self.known_log_pods.add(pod_key)
 
     def parse_pod_metadata(self):
         """Parse pod YAML files to extract metadata."""
@@ -300,6 +330,8 @@ class MustGatherParser:
                 print(f"    Error parsing {yaml_file}: {e}")
                 self.stats['errors'] += 1
 
+        self.db.commit()
+
     def parse_events(self):
         """Parse K8s events.yaml files."""
         event_files = self.base_path.glob("namespaces/*/core/events.yaml")
@@ -322,6 +354,8 @@ class MustGatherParser:
             except Exception as e:
                 print(f"    Error parsing {event_file}: {e}")
                 self.stats['errors'] += 1
+
+        self.db.commit()
 
     def _parse_event_item(self, event: Dict, source_file: str):
         """Parse individual event item."""
@@ -389,6 +423,8 @@ class MustGatherParser:
                 print(f"    Error parsing {log_file}: {e}")
                 self.stats['errors'] += 1
 
+        self.db.commit()
+
     def _parse_scheduler_line(self, line: str, source_file: str):
         """Parse individual scheduler log line for scheduling decisions."""
         # Format: 2026-09-18T21:10:49.848779631Z I0918 21:10:49.848732       1 schedule_one.go:314] "Successfully bound pod to node" pod="namespace/podname" node="nodename" evaluatedNodes=19 feasibleNodes=15
@@ -428,8 +464,7 @@ class MustGatherParser:
             message += f" ({', '.join(metrics)})"
 
         # Ensure pod exists (auto-discover from scheduler logs)
-        if self.db.ensure_pod_exists_by_name(namespace, pod_name, node):
-            self.stats['pods_from_logs'] += 1
+        self.ensure_log_pod_exists(namespace, pod_name, node)
 
         # Record as log event
         self.db.insert_log_event(
@@ -484,6 +519,7 @@ class MustGatherParser:
                     f"{file_lines:,} lines scanned; {file_events:,} pod event(s) recorded.",
                     flush=True
                 )
+                self.db.commit()
 
             except Exception as e:
                 print(f"    Error parsing {log_file}: {e}")
@@ -521,9 +557,10 @@ class MustGatherParser:
                 # Parse timestamp - must-gather format doesn't include year
                 try:
                     # Assume current year from must-gather timestamp file
-                    ts = datetime.strptime(timestamp_str, '%b %d %H:%M:%S.%f')
-                    # Use 2026 based on the event times we saw
-                    timestamp = f"2026-{ts.month:02d}-{ts.day:02d}T{ts.hour:02d}:{ts.minute:02d}:{ts.second:02d}.{ts.microsecond:06d}Z"
+                    # Use 2026 based on the event times we saw.
+                    # Supplying the year avoids ambiguous yearless-date parsing.
+                    ts = datetime.strptime(f"2026 {timestamp_str}", '%Y %b %d %H:%M:%S.%f')
+                    timestamp = f"{ts.year:04d}-{ts.month:02d}-{ts.day:02d}T{ts.hour:02d}:{ts.minute:02d}:{ts.second:02d}.{ts.microsecond:06d}Z"
                 except:
                     timestamp = timestamp_str
 
@@ -535,8 +572,7 @@ class MustGatherParser:
                     log_level = 'ERROR'
 
                 # Ensure pod exists (auto-discover from logs)
-                if self.db.ensure_pod_exists_by_name(namespace, pod_name, node):
-                    self.stats['pods_from_logs'] += 1
+                self.ensure_log_pod_exists(namespace, pod_name, node)
 
                 self.db.insert_log_event(
                     timestamp, None, pod_name, namespace, node,
@@ -559,6 +595,8 @@ class MustGatherParser:
                 print(f"    Error parsing {log_file}: {e}")
                 self.stats['errors'] += 1
 
+        self.db.commit()
+
     def _parse_crio_line(self, line: str, source_file: str):
         """Parse individual CRI-O log line."""
         # Format: Apr 30 00:45:43.153110 ip-10-0-49-64 systemd[1]: message
@@ -579,8 +617,8 @@ class MustGatherParser:
             timestamp = time_match.group(1)
         else:
             try:
-                ts = datetime.strptime(timestamp_str, '%b %d %H:%M:%S.%f')
-                timestamp = f"2026-{ts.month:02d}-{ts.day:02d}T{ts.hour:02d}:{ts.minute:02d}:{ts.second:02d}.{ts.microsecond:06d}Z"
+                ts = datetime.strptime(f"2026 {timestamp_str}", '%Y %b %d %H:%M:%S.%f')
+                timestamp = f"{ts.year:04d}-{ts.month:02d}-{ts.day:02d}T{ts.hour:02d}:{ts.minute:02d}:{ts.second:02d}.{ts.microsecond:06d}Z"
             except:
                 timestamp = timestamp_str
 
@@ -902,6 +940,8 @@ def main():
                        help='Show detailed parser diagnostics')
     parser.add_argument('--progress-interval', type=int, default=10000,
                        help='Report kubelet parsing progress every N lines (default: 10000)')
+    parser.add_argument('--commit-interval', type=int, default=1000,
+                       help='Commit parser writes every N records (default: 1000)')
     parser.add_argument('--list', action='store_true',
                        help='List all pods')
     parser.add_argument('--stats', action='store_true',
@@ -921,12 +961,15 @@ def main():
 
     if args.progress_interval < 1:
         parser.error('--progress-interval must be at least 1')
+    if args.commit_interval < 1:
+        parser.error('--commit-interval must be at least 1')
 
     # Initialize database
     db = PodLifecycleDB(args.db)
 
     if args.parse:
         # Parse must-gather
+        db.set_commit_interval(args.commit_interval)
         parser_obj = MustGatherParser(
             args.must_gather_path, db, args.verbose, args.progress_interval
         )
