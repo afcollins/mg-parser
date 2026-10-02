@@ -202,9 +202,12 @@ class PodLifecycleDB:
 class MustGatherParser:
     """Parser for OpenShift must-gather archives."""
 
-    def __init__(self, must_gather_path: str, db: PodLifecycleDB):
+    def __init__(self, must_gather_path: str, db: PodLifecycleDB,
+                 verbose: bool = False, progress_interval: int = 10000):
         self.base_path = Path(must_gather_path)
         self.db = db
+        self.verbose = verbose
+        self.progress_interval = progress_interval
         self.stats = {
             'pods_from_yaml': 0,
             'pods_from_events': 0,
@@ -213,6 +216,11 @@ class MustGatherParser:
             'log_events': 0,
             'errors': 0
         }
+
+    def debug(self, message: str):
+        """Print parser diagnostics when verbose output is requested."""
+        if self.verbose:
+            print(f"    DEBUG: {message}", flush=True)
 
     def parse_all(self):
         """Parse all components of must-gather."""
@@ -432,20 +440,61 @@ class MustGatherParser:
 
     def parse_kubelet_logs(self):
         """Parse kubelet journal logs."""
-        kubelet_logs = self.base_path.glob("nodes/*/*_logs_kubelet.gz")
+        kubelet_logs = sorted(self.base_path.glob("nodes/*/*_logs_kubelet.gz"))
+        total_files = len(kubelet_logs)
+        total_lines = 0
+        kubelet_events_before = self.stats['log_events']
 
-        for log_file in kubelet_logs:
+        print(f"    Found {total_files} kubelet log archive(s).", flush=True)
+        self.debug("Kubelet discovery pattern: nodes/*/*_logs_kubelet.gz")
+
+        if not kubelet_logs:
+            return
+
+        for file_number, log_file in enumerate(kubelet_logs, start=1):
             node_name = log_file.parent.name
+            source_file = str(log_file.relative_to(self.base_path))
+            file_lines = 0
+            file_events_before = self.stats['log_events']
 
             try:
+                compressed_size = log_file.stat().st_size
+                print(
+                    f"    [{file_number}/{total_files}] Parsing {source_file} "
+                    f"({compressed_size:,} compressed bytes)...",
+                    flush=True
+                )
                 with gzip.open(log_file, 'rt') as f:
                     for line in f:
-                        self._parse_kubelet_line(line, node_name,
-                                                str(log_file.relative_to(self.base_path)))
+                        file_lines += 1
+                        total_lines += 1
+                        self._parse_kubelet_line(line, node_name, source_file)
+
+                        if file_lines % self.progress_interval == 0:
+                            file_events = self.stats['log_events'] - file_events_before
+                            print(
+                                f"      {file_lines:,} lines scanned; "
+                                f"{file_events:,} pod event(s) recorded.",
+                                flush=True
+                            )
+
+                file_events = self.stats['log_events'] - file_events_before
+                print(
+                    f"    [{file_number}/{total_files}] Finished {source_file}: "
+                    f"{file_lines:,} lines scanned; {file_events:,} pod event(s) recorded.",
+                    flush=True
+                )
 
             except Exception as e:
                 print(f"    Error parsing {log_file}: {e}")
                 self.stats['errors'] += 1
+
+        kubelet_events = self.stats['log_events'] - kubelet_events_before
+        print(
+            f"    Kubelet log parsing complete: {total_lines:,} lines scanned; "
+            f"{kubelet_events:,} pod event(s) recorded.",
+            flush=True
+        )
 
     def _parse_kubelet_line(self, line: str, node: str, source_file: str):
         """Parse individual kubelet log line."""
@@ -849,6 +898,10 @@ def main():
                        help='SQLite database file path')
     parser.add_argument('--parse', action='store_true',
                        help='Parse must-gather and populate database')
+    parser.add_argument('--verbose', action='store_true',
+                       help='Show detailed parser diagnostics')
+    parser.add_argument('--progress-interval', type=int, default=10000,
+                       help='Report kubelet parsing progress every N lines (default: 10000)')
     parser.add_argument('--list', action='store_true',
                        help='List all pods')
     parser.add_argument('--stats', action='store_true',
@@ -866,12 +919,17 @@ def main():
 
     args = parser.parse_args()
 
+    if args.progress_interval < 1:
+        parser.error('--progress-interval must be at least 1')
+
     # Initialize database
     db = PodLifecycleDB(args.db)
 
     if args.parse:
         # Parse must-gather
-        parser_obj = MustGatherParser(args.must_gather_path, db)
+        parser_obj = MustGatherParser(
+            args.must_gather_path, db, args.verbose, args.progress_interval
+        )
         parser_obj.parse_all()
 
     # Query interface

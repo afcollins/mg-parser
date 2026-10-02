@@ -31,6 +31,14 @@ python3 pod_lifecycle_tracker.py . --parse
 
 This creates `pod_lifecycle.db` with all parsed data.
 
+For large must-gathers, kubelet parsing reports each archive and progress every
+10,000 scanned lines. Use `--verbose` to show parser diagnostics, or adjust the
+progress interval when you want more or less frequent updates:
+
+```bash
+python3 pod_lifecycle_tracker.py . --parse --verbose --progress-interval 1000
+```
+
 ### Rebuild after parser changes or a repeated parse
 
 Parsing adds events, log events, and container records to the database; it does
