@@ -62,6 +62,19 @@ If you use `--db`, remove that database file instead. This is required for the
 kubelet filename-discovery change so the new files are included without retaining
 the incomplete prior result set.
 
+### Optimize an existing database for pod lookups
+
+For an existing large database, create the indexes used by `--pod` without
+reparsing the must-gather:
+
+```bash
+python3 pod_lifecycle_tracker.py --db pod_lifecycle.db --optimize-db
+```
+
+This is a one-time operation. It may take time and require additional disk space
+while SQLite builds indexes, but subsequent `--pod` lookups use indexed UID and
+namespace/name queries.
+
 ### 2. Query patterns
 
 **Quick search - find pods scheduled in time window:**

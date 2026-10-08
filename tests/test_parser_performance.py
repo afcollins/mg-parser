@@ -18,7 +18,7 @@ try:
 except ModuleNotFoundError:
     sys.modules['yaml'] = types.ModuleType('yaml')
 
-from pod_lifecycle_tracker import MustGatherParser, PodLifecycleDB
+from pod_lifecycle_tracker import MustGatherParser, PodLifecycleDB, PodLifecycleQuery
 
 
 class RecordingDB:
@@ -78,6 +78,37 @@ class ParserPerformanceTests(unittest.TestCase):
 
         self.assertEqual(db.ensure_calls, [('ns', 'pod', 'node')])
         self.assertEqual(len(db.log_events), 2)
+
+    def test_optimizer_indexes_both_pod_log_lookup_paths(self):
+        """Pod lifecycle lookup returns UID and namespace/name log records."""
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / 'lifecycle.db'
+            db = PodLifecycleDB(str(db_path))
+            db.insert_pod('uid-1', 'ns', 'pod', 'node')
+            db.insert_log_event(
+                '2026-01-01T00:00:01Z', 'uid-1', 'pod', 'ns', 'node',
+                'kubelet', 'INFO', 'uid event', 'source'
+            )
+            db.insert_log_event(
+                '2026-01-01T00:00:02Z', None, 'pod', 'ns', 'node',
+                'kubelet', 'INFO', 'name event', 'source'
+            )
+
+            with redirect_stdout(io.StringIO()):
+                db.optimize_query_indexes()
+
+            indexes = {
+                row['name'] for row in db.conn.execute('PRAGMA index_list(log_events)')
+            }
+            self.assertIn('idx_log_events_pod_uid_time', indexes)
+            self.assertIn('idx_log_events_namespace_pod_name_time', indexes)
+
+            lifecycle = PodLifecycleQuery(db).get_pod_lifecycle(pod_uid='uid-1')
+            self.assertEqual(
+                [event['message'] for event in lifecycle['log_events']],
+                ['uid event', 'name event']
+            )
+            db.close()
 
     def test_hostname_kubelet_archive_reports_progress(self):
         """Hostname-named gzip archives are discovered and produce progress."""

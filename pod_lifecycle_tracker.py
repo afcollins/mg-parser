@@ -125,6 +125,40 @@ class PodLifecycleDB:
         if self.pending_writes >= self.commit_interval:
             self.commit()
 
+    def optimize_query_indexes(self):
+        """Create indexes used by pod lifecycle lookups and refresh statistics."""
+        indexes = [
+            (
+                'idx_events_pod_uid_time',
+                'CREATE INDEX IF NOT EXISTS idx_events_pod_uid_time '
+                'ON events(pod_uid, event_time)',
+            ),
+            (
+                'idx_log_events_pod_uid_time',
+                'CREATE INDEX IF NOT EXISTS idx_log_events_pod_uid_time '
+                'ON log_events(pod_uid, timestamp)',
+            ),
+            (
+                'idx_log_events_namespace_pod_name_time',
+                'CREATE INDEX IF NOT EXISTS idx_log_events_namespace_pod_name_time '
+                'ON log_events(namespace, pod_name, timestamp)',
+            ),
+            (
+                'idx_containers_pod_uid',
+                'CREATE INDEX IF NOT EXISTS idx_containers_pod_uid '
+                'ON containers(pod_uid)',
+            ),
+        ]
+        cursor = self.conn.cursor()
+        for index_name, statement in indexes:
+            print(f"  Creating {index_name}...", flush=True)
+            cursor.execute(statement)
+        self.commit()
+
+        print("  Refreshing SQLite query planner statistics...", flush=True)
+        cursor.execute("ANALYZE")
+        self.commit()
+
     def insert_pod(self, uid: str, namespace: str, name: str, node: str = None,
                    created_at: str = None, yaml_path: str = None):
         """Insert or update pod record."""
@@ -259,6 +293,9 @@ class MustGatherParser:
 
         print("  Parsing crio logs...")
         self.parse_crio_logs()
+
+        print("  Optimizing database query indexes...")
+        self.db.optimize_query_indexes()
 
         # Get total pod count from DB
         cursor = self.db.conn.cursor()
@@ -682,16 +719,16 @@ class PodLifecycleQuery:
         cursor = self.db.conn.cursor()
 
         # Get pod info
-        if pod_uid:
-            cursor.execute("SELECT * FROM pods WHERE uid = ?", (pod_uid,))
-        elif namespace and pod_name:
-            cursor.execute("SELECT * FROM pods WHERE namespace = ? AND name = ?",
-                         (namespace, pod_name))
-        else:
+        if not pod_uid and not (namespace and pod_name):
             return None
 
-        pod = cursor.execute("SELECT * FROM pods WHERE uid = ? OR (namespace = ? AND name = ?)",
-                           (pod_uid or '', namespace or '', pod_name or '')).fetchone()
+        if pod_uid:
+            pod = cursor.execute("SELECT * FROM pods WHERE uid = ?", (pod_uid,)).fetchone()
+        else:
+            pod = cursor.execute(
+                "SELECT * FROM pods WHERE namespace = ? AND name = ?",
+                (namespace, pod_name)
+            ).fetchone()
         if not pod:
             return None
 
@@ -705,13 +742,28 @@ class PodLifecycleQuery:
         """, (pod_uid,))
         events = [dict(row) for row in cursor.fetchall()]
 
-        # Get log events
+        # Get log events. Use separate indexed lookups rather than a single OR
+        # clause, which can force SQLite to scan a large log_events table.
         cursor.execute("""
             SELECT * FROM log_events
-            WHERE pod_uid = ? OR (namespace = ? AND pod_name = ?)
+            WHERE pod_uid = ?
             ORDER BY timestamp
-        """, (pod_uid, pod['namespace'], pod['name']))
-        log_events = [dict(row) for row in cursor.fetchall()]
+        """, (pod_uid,))
+        log_events_by_uid = [dict(row) for row in cursor.fetchall()]
+
+        cursor.execute("""
+            SELECT * FROM log_events
+            WHERE namespace = ? AND pod_name = ?
+            ORDER BY timestamp
+        """, (pod['namespace'], pod['name']))
+        log_events_by_name = [dict(row) for row in cursor.fetchall()]
+
+        log_events_by_id = {
+            event['id']: event for event in log_events_by_uid + log_events_by_name
+        }
+        log_events = sorted(
+            log_events_by_id.values(), key=lambda event: event['timestamp'] or ''
+        )
 
         # Get containers
         cursor.execute("""
@@ -942,6 +994,8 @@ def main():
                        help='Report kubelet parsing progress every N lines (default: 10000)')
     parser.add_argument('--commit-interval', type=int, default=1000,
                        help='Commit parser writes every N records (default: 1000)')
+    parser.add_argument('--optimize-db', action='store_true',
+                       help='Create query indexes and refresh SQLite statistics')
     parser.add_argument('--list', action='store_true',
                        help='List all pods')
     parser.add_argument('--stats', action='store_true',
@@ -974,6 +1028,10 @@ def main():
             args.must_gather_path, db, args.verbose, args.progress_interval
         )
         parser_obj.parse_all()
+
+    if args.optimize_db and not args.parse:
+        print("Optimizing database query indexes...")
+        db.optimize_query_indexes()
 
     # Query interface
     query = PodLifecycleQuery(db)
